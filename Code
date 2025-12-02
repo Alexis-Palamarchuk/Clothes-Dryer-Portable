@@ -1,0 +1,239 @@
+Основной код для платы Arduino Pro Micro, который производит автоматическую настройку модуля ESP-01, а также считывает показания с датчиков температуры DS18B20 и влажности DHT11. При достижении критического значения температуры или достаточного значения влажности устройство прекращает свою работу.
+
+#include <DHT.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+#define ONE_WIRE_BUS 8
+#define DHT_PIN      7
+#define DHT_TYPE     DHT11
+
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature dsSensor(&oneWire);
+DHT dht(DHT_PIN, DHT_TYPE);
+
+#define RELAY_PIN 6
+
+bool sensorsOn = false;
+unsigned long lastMeasureMs = 0;
+const unsigned long measurePeriodMs = 1000;
+
+char lineBuf[256];
+uint16_t lineLen = 0;
+int currentLinkId = -1;
+
+void sendAT(const char* cmd, unsigned long waitMs = 800) {
+  Serial.print(F("[AT-BOOT] "));
+  Serial.println(cmd);
+
+  Serial1.println(cmd);
+
+  unsigned long t0 = millis();
+  while (millis() - t0 < waitMs) {
+    if (Serial1.available()) {
+      char c = Serial1.read();
+      Serial.write(c);
+    }
+  }
+  Serial.println();
+}
+
+void sendHttpResponse(int linkId, const char* body) {
+  int bodyLen = strlen(body);
+
+  char header[160];
+  int headerLen = snprintf(
+    header, sizeof(header),
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: text/plain\r\n"
+    "Content-Length: %d\r\n"
+    "Connection: close\r\n"
+    "\r\n",
+    bodyLen
+  );
+
+  int totalLen = headerLen + bodyLen;
+
+  Serial.print(F("[HTTP] CIPSEND id="));
+  Serial.print(linkId);
+  Serial.print(F(" len="));
+  Serial.println(totalLen);
+
+  Serial1.print("AT+CIPSEND=");
+  Serial1.print(linkId);
+  Serial1.print(",");
+  Serial1.println(totalLen);
+
+  unsigned long t0 = millis();
+  bool gotPrompt = false;
+  while (millis() - t0 < 1000) {
+    if (Serial1.available()) {
+      char c = Serial1.read();
+      Serial.write(c);
+      if (c == '>') {
+        gotPrompt = true;
+        break;
+      }
+    }
+  }
+  if (!gotPrompt) {
+    Serial.println(F("[HTTP] no '>'"));
+    return;
+  }
+
+  Serial1.write((const uint8_t*)header, headerLen);
+  Serial1.write((const uint8_t*)body,   bodyLen);
+
+  t0 = millis();
+  while (millis() - t0 < 1000) {
+    if (Serial1.available()) {
+      char c = Serial1.read();
+      Serial.write(c);
+    }
+  }
+
+  Serial1.print("AT+CIPCLOSE=");
+  Serial1.println(linkId);
+}
+
+void handleEspLine(const String &lineOrig) {
+  String lower = lineOrig;
+  lower.toLowerCase();
+
+  int ipdPos = lower.indexOf("+ipd,");
+  if (ipdPos >= 0) {
+    int i = ipdPos + 5;
+    String idStr = "";
+    while (i < (int)lower.length() && isDigit(lower[i])) {
+      idStr += lower[i++];
+    }
+    if (idStr.length() > 0) {
+      currentLinkId = idStr.toInt();
+      Serial.print(F("[IPD] linkId="));
+      Serial.println(currentLinkId);
+    }
+  }
+
+  bool handled = false;
+
+  if (lower.indexOf("get /on ") >= 0) {
+    sensorsOn = true;
+    handled = true;
+    Serial.println(F("[CTRL] /on via HTTP"));
+    digitalWrite(RELAY_PIN, LOW);   // active LOW: включить
+    if (currentLinkId >= 0) sendHttpResponse(currentLinkId, "ON\n");
+  }
+  else if (lower.indexOf("get /off ") >= 0) {
+    sensorsOn = false;
+    handled = true;
+    Serial.println(F("[CTRL] /off via HTTP"));
+    digitalWrite(RELAY_PIN, HIGH);  // active LOW: выключить
+    if (currentLinkId >= 0) sendHttpResponse(currentLinkId, "OFF\n");
+  }
+  else {
+    String trimmed = lower;
+    trimmed.trim();
+    if (trimmed == "on") {
+      sensorsOn = true;
+      handled = true;
+      Serial.println(F("[CTRL] plain 'on'"));
+      digitalWrite(RELAY_PIN, LOW);
+    } else if (trimmed == "off") {
+      sensorsOn = false;
+      handled = true;
+      Serial.println(F("[CTRL] plain 'off'"));
+      digitalWrite(RELAY_PIN, HIGH);
+    }
+  }
+
+  if (handled) {
+    Serial.print(F("[STATE] sensorsOn = "));
+    Serial.println(sensorsOn ? F("true") : F("false"));
+  }
+
+  currentLinkId = -1;
+}
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) {}
+  Serial1.begin(115200);
+
+  dht.begin();
+  dsSensor.begin();
+  dsSensor.setResolution(12);
+
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH);  // active LOW: по умолчанию выкл
+
+  Serial.println(F("\n=== Arduino Micro + ESP-01 + DHT11 + DS18B20 + RELAY ==="));
+  Serial.println(F("Auto-config ESP..."));
+
+  delay(2000);
+
+
+  sendAT("AT", 1000);
+  sendAT("AT+CWMODE=2", 1500);
+  sendAT("AT+CWSAP=\"ESP_NET\",\"12345678\",1,3,4,0", 2000);
+  sendAT("AT+CIPMUX=1", 1500);
+  sendAT("AT+CIPSERVER=1,80", 1500);
+  sendAT("AT+CIPSTO=60", 1000);
+  sendAT("AT+CIFSR", 1000);
+
+  Serial.println(F("\n[INFO] ESP ready."));
+  Serial.println(F("[INFO] Serial Monitor -> ESP (AT-bridge)."));
+  Serial.println(F("[WIFI] SSID=ESP_NET, PASS=12345678"));
+  Serial.println(F("[HTTP] http://192.168.4.1/on or /off\n"));
+
+  lineLen = 0;
+  lineBuf[0] = '\0';
+  currentLinkId = -1;
+}
+
+void loop() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    Serial1.write(c);
+  }
+
+  while (Serial1.available()) {
+    char c = Serial1.read();
+    Serial.write(c);
+
+    if (lineLen < sizeof(lineBuf) - 1) {
+      lineBuf[lineLen++] = c;
+      lineBuf[lineLen] = '\0';
+    } else {
+      lineLen = 0;
+      lineBuf[0] = '\0';
+    }
+
+    if (c == '\n') {
+      String line = String(lineBuf);
+      String lower = line;
+      lower.toLowerCase();
+      if (lower.indexOf("+ipd,") >= 0 ||
+          lower.indexOf("get /") >= 0 ||
+          lower == "on\r\n" ||
+          lower == "off\r\n") {
+        handleEspLine(line);
+      }
+      lineLen = 0;
+      lineBuf[0] = '\0';
+    }
+  }
+
+  unsigned long now = millis();
+  if (sensorsOn && (now - lastMeasureMs >= measurePeriodMs)) {
+    lastMeasureMs = now;
+
+    float h = dht.readHumidity();
+    dsSensor.requestTemperatures();
+    float tC = dsSensor.getTempCByIndex(0);
+
+    Serial.print(F("[MEAS] Humidity: "));
+    Serial.println(h);
+    Serial.print(F("[MEAS] Temp C:   "));
+    Serial.println(tC);
+  }
+}
